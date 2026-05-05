@@ -28,7 +28,7 @@ ALL_SCANNER_IMAGES = {
 
 POC_REQUEST = {
     "scanners": ["trivy", "grype"],
-    "source": "https://github.com/docker/getting-started",
+    "source": "https://github.com/dockersamples/example-voting-app",
     "mode": "sequential",
 }
 
