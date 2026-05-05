@@ -182,15 +182,74 @@ Python 3.8 is the minimum version. The service uses `list[str]` type hints and `
 
 ## Setup & Run
 
-One command does everything:
+On a Linux server, run the service in one terminal and keep it open:
 
 ```bash
 python3 run.py
 ```
 
-After it completes, the API is live at:
-- API base: `http://localhost:8000`
-- Interactive docs (Swagger UI): `http://localhost:8000/docs`
+Watch the startup output carefully. `run.py` automatically selects the first free port from `8000` to `8009`:
+
+```text
+[*] Checking port availability...
+    Using port 8001
+
+[*] Starting API server...
+    API:   http://localhost:8001
+    Docs:  http://localhost:8001/docs
+```
+
+Use the same port when calling `client.py`. In a second terminal:
+
+```bash
+python3 client.py \
+  --port 8001 \
+  --source https://github.com/docker/welcome-to-docker \
+  --scanners trivy grype \
+  --mode sequential \
+  --service-version v1.2 \
+  --branch main
+```
+
+If `run.py` prints `Using port 8000`, omit `--port` or pass `--port 8000`. If it prints `Using port 8001`, pass `--port 8001`.
+
+Verify the API before sending scans:
+
+```bash
+curl http://localhost:8001/health
+```
+
+Expected response:
+
+```json
+{"status":"ok"}
+```
+
+Interactive docs are available at `http://localhost:<PORT>/docs`.
+
+### Source Repository Requirements
+
+The `--source` value must be a GitHub repository URL that this server can clone:
+
+- It must start with `https://github.com/`.
+- It must be public, unless the server has Git credentials configured for private repos.
+- It must contain a file named exactly `Dockerfile` at the repository root.
+- The Dockerfile must build successfully with `docker build -t sample-image:latest /tmp/repo`.
+- If you pass `--branch`, that branch must exist in the repository.
+
+Good example:
+
+```bash
+--source https://github.com/docker/welcome-to-docker
+```
+
+Bad examples:
+
+```bash
+--source https://github.com/org/repo-with-dockerfile-in-subfolder
+--source git@github.com:org/repo.git
+--source https://gitlab.com/org/repo
+```
 
 ---
 
@@ -815,7 +874,8 @@ Both directories are created by `run.py` on startup and re-created (if missing) 
 | Error | Cause | Fix |
 |-------|-------|-----|
 | `[Errno 98] address already in use` | Port 8000 is taken by another process | `run.py` automatically tries ports 8001–8009 and picks the first free one |
-| `HTTP 403 Forbidden` on `/scan` | `output/` directory does not exist or wrong permissions when Docker tries to mount it | `run.py` creates `output/` before starting the server. If it persists: `mkdir -p output && chmod 755 output` |
+| `HTTP 403 Forbidden` on `/scan` with an HTML body | `client.py` is probably hitting a different service or the wrong port, not this FastAPI app | Check the port printed by `run.py`, then call `client.py --port <PORT>`. Verify with `curl http://localhost:<PORT>/health`. |
+| Docker mount/output permission error | `output/` directory does not exist or has wrong permissions when Docker tries to mount it | `run.py` creates `output/` before starting the server. If it persists: `mkdir -p output && chmod 755 output` |
 | `git clone` fails | Repo URL is wrong or network issue | Check the URL starts with `https://github.com/` and the repo is public |
 | `No Dockerfile at root` | The repo doesn't have a `Dockerfile` at its root level | Use a repo that has a `Dockerfile` at the root, not in a subdirectory |
 
@@ -930,6 +990,17 @@ python3 client.py --payload '{"source": "https://github.com/org/repo", "scanners
 python3 client.py --host 192.168.1.10 --port 8001 --source https://github.com/org/repo
 ```
 
+**Port 8001 sequential example:**
+```bash
+python3 client.py \
+  --port 8001 \
+  --source https://github.com/docker/welcome-to-docker \
+  --scanners trivy grype \
+  --mode sequential \
+  --service-version v1.2 \
+  --branch main
+```
+
 ### Options
 
 | Flag | Default | Description |
@@ -943,6 +1014,8 @@ python3 client.py --host 192.168.1.10 --port 8001 --source https://github.com/or
 | `--timeout` | `900` | Request timeout in seconds. |
 
 Current `client.py` also supports `--service-version` (default `v1.0`) and `--branch` (optional) for Azure blob path metadata and branch-specific scans.
+
+The `--source` repository must have a root-level `Dockerfile`. Repositories with a Dockerfile only inside a subdirectory are rejected by the service.
 
 ### Payload priority
 
