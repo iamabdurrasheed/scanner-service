@@ -7,11 +7,11 @@ import logging
 import time
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, HttpUrl, field_validator
+from pydantic import BaseModel, field_validator
 
-from utils import prepare_directories, clone_repository, build_docker_image
+from utils import prepare_directories, clone_repository, build_docker_image, remove_docker_image
 from scanner import run_sequential, run_parallel
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -107,12 +107,16 @@ def scan(request: ScanRequest):
             scan_output = run_parallel(request.scanners)
     except Exception as e:
         logger.exception("Scanner execution raised an unexpected error")
+        remove_docker_image(IMAGE_TAG)
         return JSONResponse(
             status_code=500,
             content={"status": "failed", "error": f"Scanner error: {str(e)}"},
         )
 
-    # ── Step 5: Build response ───────────────────────────────────────────────
+    # ── Step 5: Remove built image to free disk ──────────────────────────────
+    remove_docker_image(IMAGE_TAG)
+
+    # ── Step 6: Build response ───────────────────────────────────────────────
     total_duration = round(time.time() - start, 2)
 
     response = {

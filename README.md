@@ -108,6 +108,9 @@ python3 run.py
                           ├── trivy → writes output/trivy_result.json via -o flag
                           └── grype → stdout captured → written by run_scanner_sync()
                                │
+                          utils.py → remove_docker_image()
+                          └── docker rmi -f sample-image:latest  ← frees disk after every scan
+                               │
                           main.py assembles and returns JSON response
                                │
                           run.py prints response to terminal
@@ -300,7 +303,7 @@ Here is exactly what happens from the moment `run.py` fires the POC request to t
 POC_REQUEST = {
     "scanners": ["trivy", "grype"],
     "source": "https://github.com/docker/welcome-to-docker",
-    "mode": "sequential",
+    "mode": "parallel",
 }
 ```
 
@@ -361,6 +364,7 @@ grype finishes    → ProcessMonitor.stop()             ← monitoring ends
 - `subprocess.Popen()` launches the scanner — `Popen` (not `run`) is used specifically because it returns the PID immediately so the monitor can attach before the process finishes
 - `ProcessMonitor.start(pid)` spins up a background thread that polls **host-level** `psutil.cpu_percent()`, `psutil.virtual_memory()` and `psutil.disk_usage("/")` every 1 second
 - `proc.communicate(timeout=600)` blocks until the scanner finishes, collecting stdout/stderr
+- If the 600s timeout fires, `docker stop --time 10 <container_name>` is called to stop only our container, then `proc.wait()` waits for the host process to exit naturally. No other process on the server is touched.
 - `ProcessMonitor.stop()` signals the thread to stop and records `end_time`
 - `merge_metrics()` combines both scanners' sample lists into one `resource_usage` dict
 
@@ -425,7 +429,17 @@ output/grype_result.json   ← written by run_scanner_sync from captured stdout
 
 These files are overwritten on every scan because Stage 3 wipes `output/` at the start of each request.
 
-### Stage 8 — Build and return response (`main.py`)
+### Stage 8 — Remove built image (`utils.py → remove_docker_image`)
+
+After scanning completes (or if the scanner raises an exception), `sample-image:latest` is removed from Docker:
+
+```bash
+docker rmi -f sample-image:latest
+```
+
+This frees the disk space used by the built image after every scan. The scanner images (`aquasec/trivy:latest` and `anchore/grype:latest`) are **not** removed — they are reused across scans.
+
+### Stage 9 — Build and return response (`main.py`)
 
 `main.py` assembles the final response dict and returns `JSONResponse(status_code=200)`:
 
@@ -435,7 +449,7 @@ These files are overwritten on every scan because Stage 3 wipes `output/` at the
 - `per_scanner_metrics` → per-scanner pid, start/end time (UTC), duration, cpu avg/peak, memory avg/peak, disk avg/peak
 - `errors` → only included when `status` is `"partial"`
 
-### Stage 9 — run.py prints response to terminal
+### Stage 10 — run.py prints response to terminal
 
 `run.py` receives the HTTP response, parses the JSON, and prints it with `json.dumps(result, indent=2)`.
 
@@ -732,7 +746,7 @@ cat output/grype_result.json | python3 -m json.tool | head -60
 | `git clone` fails | 422 | `failed` | `utils.py → clone_repository` |
 | No `Dockerfile` in repo root | 422 | `failed` | `utils.py → clone_repository` |
 | `docker build` fails | 500 | `failed` | `utils.py → build_docker_image` |
-| One scanner fails, others succeed | 200 | `partial` | `scanner.py → run_scanner_sync` |
+| Scanner timeout (600s exceeded) | 200 | `partial` | `scanner.py` — `docker stop` our container, `proc.wait()`, returns timeout error |
 | All scanners fail | 200 | `partial` | `scanner.py` |
 | Unexpected exception in scanner | 500 | `failed` | `main.py` — try/except around scanner call |
 | Directory preparation fails | 500 | `failed` | `main.py` — try/except around prepare_directories |

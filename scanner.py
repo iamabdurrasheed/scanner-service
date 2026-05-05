@@ -91,6 +91,16 @@ def grype_cmd(container_name: str) -> list[str]:
 # Synchronous (blocking) single-scanner runner
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _stop_container(container_name: str):
+    """
+    Gracefully stop a scanner container on timeout.
+    Only stops the container we launched — identified by the unique timestamped
+    name we assigned it. Cannot affect any other container on the server.
+    """
+    subprocess.run(["docker", "stop", "--time", "10", container_name], capture_output=True)
+    logger.warning(f"Stopped container {container_name} after scan timeout")
+
+
 def run_scanner_sync(scanner: Literal["trivy", "grype"]) -> tuple[bool, str, ResourceMetrics]:
     """
     Run a single scanner inside a Docker container, monitoring resource usage
@@ -107,7 +117,15 @@ def run_scanner_sync(scanner: Literal["trivy", "grype"]) -> tuple[bool, str, Res
         logger.info(f"[trivy] docker run command: {' '.join(cmd)}")
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         monitor.start(proc.pid)
-        stdout, stderr = proc.communicate(timeout=600)
+        try:
+            stdout, stderr = proc.communicate(timeout=600)
+        except subprocess.TimeoutExpired:
+            # Stop only our container (unique name = trivy-scan-<timestamp>)
+            # proc.wait() exits naturally once the container stops — no force kill
+            _stop_container(container_name)
+            proc.wait()
+            monitor.stop()
+            return False, "trivy timed out after 600s", monitor.metrics
         monitor.stop()
 
         if proc.returncode != 0:
@@ -120,7 +138,15 @@ def run_scanner_sync(scanner: Literal["trivy", "grype"]) -> tuple[bool, str, Res
         logger.info(f"[grype] docker run command: {' '.join(cmd)}")
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         monitor.start(proc.pid)
-        stdout, stderr = proc.communicate(timeout=600)
+        try:
+            stdout, stderr = proc.communicate(timeout=600)
+        except subprocess.TimeoutExpired:
+            # Stop only our container (unique name = grype-scan-<timestamp>)
+            # proc.wait() exits naturally once the container stops — no force kill
+            _stop_container(container_name)
+            proc.wait()
+            monitor.stop()
+            return False, "grype timed out after 600s", monitor.metrics
         monitor.stop()
 
         if proc.returncode != 0:
@@ -128,7 +154,6 @@ def run_scanner_sync(scanner: Literal["trivy", "grype"]) -> tuple[bool, str, Res
             logger.error(f"grype container failed (rc={proc.returncode}): {err}")
             return False, f"grype failed: {err}", monitor.metrics
 
-        # Grype outputs JSON to stdout → save it to the host output directory
         with open(output_file, "wb") as f:
             f.write(stdout)
 

@@ -77,3 +77,15 @@ def build_docker_image(tag: str = "sample-image:latest") -> tuple[bool, str]:
         logger.error(f"docker build failed: {msg}")
         return False, f"Docker build failed: {msg}"
     return True, f"Docker image {tag} built successfully."
+
+
+def remove_docker_image(tag: str = "sample-image:latest"):
+    """Remove the scanned image from Docker to free disk space."""
+    result = subprocess.run(
+        ["docker", "rmi", "-f", tag],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        logger.info(f"Removed Docker image {tag}")
+    else:
+        logger.warning(f"Could not remove image {tag}: {result.stderr.strip()}")
