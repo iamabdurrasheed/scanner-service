@@ -29,7 +29,7 @@ ALL_SCANNER_IMAGES = {
 POC_REQUEST = {
     "scanners": ["trivy", "grype"],
     "source": "https://github.com/docker/welcome-to-docker",
-    "mode": "sequential",
+    "mode": "parallel",
 }
 
 PORT = int(os.environ.get("PORT", 8000))

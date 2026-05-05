@@ -1,6 +1,6 @@
 """
 monitor.py - Resource monitoring using psutil
-Tracks CPU and memory usage of scan processes.
+Tracks host system CPU, memory and disk usage during scans.
 """
 
 import psutil
@@ -16,7 +16,8 @@ class ResourceMetrics:
     start_time: Optional[float] = None
     end_time: Optional[float] = None
     cpu_samples: list = field(default_factory=list)
-    mem_samples: list = field(default_factory=list)  # in MB
+    mem_samples: list = field(default_factory=list)   # used RAM in MB
+    disk_samples: list = field(default_factory=list)  # used disk in GB
 
     @property
     def duration_seconds(self) -> float:
@@ -48,6 +49,18 @@ class ResourceMetrics:
             return "0MB"
         return f"{round(max(self.mem_samples), 1)}MB"
 
+    @property
+    def disk_avg(self) -> str:
+        if not self.disk_samples:
+            return "0GB"
+        return f"{round(sum(self.disk_samples) / len(self.disk_samples), 2)}GB"
+
+    @property
+    def disk_peak(self) -> str:
+        if not self.disk_samples:
+            return "0GB"
+        return f"{round(max(self.disk_samples), 2)}GB"
+
     def to_dict(self) -> dict:
         return {
             "pid": self.pid,
@@ -58,13 +71,15 @@ class ResourceMetrics:
             "cpu_peak": self.cpu_peak,
             "memory_avg": self.mem_avg,
             "memory_peak": self.mem_peak,
+            "disk_used_avg": self.disk_avg,
+            "disk_used_peak": self.disk_peak,
         }
 
 
 class ProcessMonitor:
     """
-    Polls a process every `interval` seconds collecting CPU% and RSS memory.
-    Call start(pid) to begin monitoring, stop() to end it.
+    Tracks host-level CPU, RAM and disk every `interval` seconds.
+    Attached per scanner so each gets its own window of samples.
     """
 
     def __init__(self, interval: float = 1.0):
@@ -86,36 +101,26 @@ class ProcessMonitor:
         self.metrics.end_time = time.time()
 
     def _poll(self):
-        try:
-            proc = psutil.Process(self.metrics.pid)
-            # First call initialises the CPU interval counter
-            proc.cpu_percent(interval=None)
-            while not self._stop_event.is_set():
-                time.sleep(self.interval)
-                if not proc.is_running():
-                    break
-                try:
-                    cpu = proc.cpu_percent(interval=None)
-                    mem_mb = proc.memory_info().rss / (1024 * 1024)
-                    self.metrics.cpu_samples.append(cpu)
-                    self.metrics.mem_samples.append(mem_mb)
+        psutil.cpu_percent(interval=None)  # initialise cpu counter
+        while not self._stop_event.is_set():
+            time.sleep(self.interval)
+            # Host CPU
+            cpu = psutil.cpu_percent(interval=None)
+            # Host RAM
+            mem = psutil.virtual_memory()
+            mem_used_mb = (mem.total - mem.available) / (1024 * 1024)
+            # Host disk (root partition)
+            disk = psutil.disk_usage("/")
+            disk_used_gb = disk.used / (1024 * 1024 * 1024)
 
-                    # Also capture child processes (e.g. docker sub-processes)
-                    for child in proc.children(recursive=True):
-                        try:
-                            cpu += child.cpu_percent(interval=None)
-                            mem_mb += child.memory_info().rss / (1024 * 1024)
-                        except (psutil.NoSuchProcess, psutil.AccessDenied):
-                            pass
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    break
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
+            self.metrics.cpu_samples.append(cpu)
+            self.metrics.mem_samples.append(mem_used_mb)
+            self.metrics.disk_samples.append(disk_used_gb)
 
 
 class SystemMonitor:
     """
-    Monitors overall system CPU and memory (useful for parallel mode).
+    Monitors overall host CPU, RAM and disk — used in parallel mode.
     """
 
     def __init__(self, interval: float = 1.0):
@@ -142,27 +147,28 @@ class SystemMonitor:
             time.sleep(self.interval)
             cpu = psutil.cpu_percent(interval=None)
             mem = psutil.virtual_memory()
-            mem_mb = (mem.total - mem.available) / (1024 * 1024)
+            mem_used_mb = (mem.total - mem.available) / (1024 * 1024)
+            disk = psutil.disk_usage("/")
+            disk_used_gb = disk.used / (1024 * 1024 * 1024)
+
             self.metrics.cpu_samples.append(cpu)
-            self.metrics.mem_samples.append(mem_mb)
+            self.metrics.mem_samples.append(mem_used_mb)
+            self.metrics.disk_samples.append(disk_used_gb)
 
 
 def merge_metrics(metrics_list: list[ResourceMetrics]) -> dict:
     """Merge multiple ResourceMetrics into a single summary dict."""
-    all_cpu = []
-    all_mem = []
+    all_cpu, all_mem, all_disk = [], [], []
     for m in metrics_list:
         all_cpu.extend(m.cpu_samples)
         all_mem.extend(m.mem_samples)
-
-    cpu_avg = f"{round(sum(all_cpu) / len(all_cpu), 1)}%" if all_cpu else "0%"
-    cpu_peak = f"{round(max(all_cpu), 1)}%" if all_cpu else "0%"
-    mem_avg = f"{round(sum(all_mem) / len(all_mem), 1)}MB" if all_mem else "0MB"
-    mem_peak = f"{round(max(all_mem), 1)}MB" if all_mem else "0MB"
+        all_disk.extend(m.disk_samples)
 
     return {
-        "cpu_avg": cpu_avg,
-        "cpu_peak": cpu_peak,
-        "memory_avg": mem_avg,
-        "memory_peak": mem_peak,
+        "cpu_avg":        f"{round(sum(all_cpu)  / len(all_cpu),  1)}%"  if all_cpu  else "0%",
+        "cpu_peak":       f"{round(max(all_cpu),  1)}%"                  if all_cpu  else "0%",
+        "memory_avg":     f"{round(sum(all_mem)  / len(all_mem),  1)}MB" if all_mem  else "0MB",
+        "memory_peak":    f"{round(max(all_mem),  1)}MB"                 if all_mem  else "0MB",
+        "disk_used_avg":  f"{round(sum(all_disk) / len(all_disk), 2)}GB" if all_disk else "0GB",
+        "disk_used_peak": f"{round(max(all_disk), 2)}GB"                 if all_disk else "0GB",
     }

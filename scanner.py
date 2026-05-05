@@ -218,10 +218,12 @@ async def run_parallel_async(scanners: list[str]) -> dict:
     # Use system-level metrics for combined usage (more accurate in parallel)
     combined = sys_monitor.metrics
     resource_usage = {
-        "cpu_avg": combined.cpu_avg,
-        "cpu_peak": combined.cpu_peak,
-        "memory_avg": combined.mem_avg,
-        "memory_peak": combined.mem_peak,
+        "cpu_avg":        combined.cpu_avg,
+        "cpu_peak":       combined.cpu_peak,
+        "memory_avg":     combined.mem_avg,
+        "memory_peak":    combined.mem_peak,
+        "disk_used_avg":  combined.disk_avg,
+        "disk_used_peak": combined.disk_peak,
     }
 
     return {
