@@ -22,6 +22,7 @@ A FastAPI service that accepts a GitHub repository URL, builds a Docker image fr
 14. [Common Errors & Fixes](#common-errors--fixes)
 15. [Scan Observations & Analysis](#scan-observations--analysis)
 16. [External Service Integration](#external-service-integration)
+17. [Using the Swagger UI (/docs)](#using-the-swagger-ui-docs)
 
 ---
 
@@ -229,26 +230,55 @@ Interactive docs are available at `http://localhost:<PORT>/docs`.
 
 ### Source Repository Requirements
 
-The `--source` value must be a GitHub repository URL that this server can clone:
+The `--source` value supports three scenarios:
 
-- It must start with `https://github.com/`.
-- It must be public, unless the server has Git credentials configured for private repos.
-- It must contain a file named exactly `Dockerfile` at the repository root.
-- The Dockerfile must build successfully with `docker build -t sample-image:latest /tmp/repo`.
-- If you pass `--branch`, that branch must exist in the repository.
-
-Good example:
+#### Scenario 1 — Public GitHub repository
 
 ```bash
---source https://github.com/docker/welcome-to-docker
+python3 client.py --source https://github.com/docker/welcome-to-docker
 ```
+
+- Must start with `https://github.com/`
+- Must be publicly accessible
+- Must have a `Dockerfile` at the repository root
+
+#### Scenario 2 — Private GitHub repository
+
+```bash
+python3 client.py \
+  --source https://github.com/your-org/private-repo \
+  --token ghp_xxxxxxxxxxxxxxxxxxxx \
+  --branch main
+```
+
+- Pass a GitHub Personal Access Token (PAT) via `--token`
+- The token is embedded into the clone URL as `https://<token>@github.com/...` — it never appears in logs
+- The token is masked as `***` in the terminal output
+- To generate a PAT: GitHub → Settings → Developer settings → Personal access tokens → Generate new token → check `repo` scope
+
+#### Scenario 3 — Local path
+
+```bash
+python3 client.py --source /path/to/local/repo
+```
+
+- Pass an absolute path (`/path/to/repo`) or relative path (`./my-repo`)
+- The directory is copied into `/tmp/repo` so the rest of the pipeline works identically
+- Must contain a `Dockerfile` at the root
+- Useful for scanning repos that are already on the server without cloning
+
+#### Requirements for all scenarios
+
+- The repo must contain a file named exactly `Dockerfile` at the root level
+- The Dockerfile must build successfully with `docker build`
+- If you pass `--branch`, that branch must exist in the repository
 
 Bad examples:
 
 ```bash
---source https://github.com/org/repo-with-dockerfile-in-subfolder
---source git@github.com:org/repo.git
---source https://gitlab.com/org/repo
+--source https://github.com/org/repo-with-dockerfile-in-subfolder  # Dockerfile not at root
+--source git@github.com:org/repo.git                               # SSH URLs not supported
+--source https://gitlab.com/org/repo                               # Only GitHub URLs supported
 ```
 
 ---
@@ -561,20 +591,16 @@ Response:
 
 **Request body fields:**
 
-In addition to the original `source`, `scanners`, and `mode` fields, the current service accepts two optional metadata fields:
-
-| Field | Default | Description |
-|-------|---------|-------------|
-| `service_version` | `v1.0` | Version label used in Azure Blob Storage paths. |
-| `branch` | repo default branch | Optional Git branch to clone and scan. Omit it to scan the repository default branch. |
-
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `source` | string | ✅ | — | GitHub repo URL. Must start with `https://github.com/`. The repo must have a `Dockerfile` at its root. |
-| `scanners` | array | ✅ | — | Which scanners to use. Valid values: `"trivy"`, `"grype"`, or both. Duplicates are ignored. |
-| `mode` | string | ❌ | `"sequential"` | `"sequential"` runs scanners one after another. `"parallel"` runs them at the same time. |
+| `source` | string | ✅ | — | GitHub URL, private GitHub URL (use with `token`), or local path. Must have a `Dockerfile` at root. |
+| `scanners` | array | ✅ | — | Which scanners to use: `"trivy"`, `"grype"`, or both. Duplicates ignored. |
+| `mode` | string | ❌ | `"sequential"` | `"sequential"` or `"parallel"`. |
+| `service_version` | string | ❌ | `"v1.0"` | Version label used in the Azure blob path. |
+| `branch` | string | ❌ | repo default | Git branch to clone. Omit to use the repo default branch. |
+| `token` | string | ❌ | — | GitHub Personal Access Token for private repos. Never logged. |
 
-**Example — single scanner:**
+**Example — public repo, single scanner:**
 ```bash
 curl -X POST http://localhost:8000/scan \
   -H "Content-Type: application/json" \
@@ -585,14 +611,40 @@ curl -X POST http://localhost:8000/scan \
   }'
 ```
 
-**Example — both scanners in parallel:**
+**Example — public repo, both scanners in parallel:**
 ```bash
 curl -X POST http://localhost:8000/scan \
   -H "Content-Type: application/json" \
   -d '{
     "scanners": ["trivy", "grype"],
     "source": "https://github.com/docker/welcome-to-docker",
-    "mode": "parallel"
+    "mode": "parallel",
+    "service_version": "v1.2",
+    "branch": "main"
+  }'
+```
+
+**Example — private repo with token:**
+```bash
+curl -X POST http://localhost:8000/scan \
+  -H "Content-Type: application/json" \
+  -d '{
+    "scanners": ["trivy", "grype"],
+    "source": "https://github.com/your-org/private-repo",
+    "token": "ghp_xxxxxxxxxxxxxxxxxxxx",
+    "mode": "sequential",
+    "branch": "main"
+  }'
+```
+
+**Example — local path:**
+```bash
+curl -X POST http://localhost:8000/scan \
+  -H "Content-Type: application/json" \
+  -d '{
+    "scanners": ["trivy", "grype"],
+    "source": "/path/to/local/repo",
+    "mode": "sequential"
   }'
 ```
 
@@ -960,19 +1012,38 @@ python3 run.py   # starts the server
 
 ### Usage
 
-**Override source only (scanners and mode use defaults):**
+**Public repo — defaults for everything else:**
 ```bash
 python3 client.py --source https://github.com/org/repo
 ```
 
-**Specify everything explicitly:**
+**Public repo — specify everything explicitly:**
 ```bash
 python3 client.py \
   --source https://github.com/org/repo \
   --scanners trivy grype \
   --mode parallel \
   --service-version v1.2 \
-  --branch develop
+  --branch main
+```
+
+**Private repo — pass a GitHub PAT:**
+```bash
+python3 client.py \
+  --source https://github.com/your-org/private-repo \
+  --token ghp_xxxxxxxxxxxxxxxxxxxx \
+  --scanners trivy grype \
+  --mode sequential \
+  --branch main
+```
+The token is embedded into the clone URL and masked as `***` in terminal output. It never appears in logs.
+
+**Local path — repo already on the server:**
+```bash
+python3 client.py \
+  --source /path/to/local/repo \
+  --scanners trivy grype \
+  --mode sequential
 ```
 
 **Single scanner:**
@@ -983,6 +1054,11 @@ python3 client.py --source https://github.com/org/repo --scanners trivy
 **Full JSON payload — for service-to-service calls:**
 ```bash
 python3 client.py --payload '{"source": "https://github.com/org/repo", "scanners": ["trivy", "grype"], "mode": "sequential"}'
+```
+
+**Private repo via JSON payload:**
+```bash
+python3 client.py --payload '{"source": "https://github.com/org/private-repo", "token": "ghp_xxx", "scanners": ["trivy"], "mode": "sequential"}'
 ```
 
 **Custom host and port — if the service runs on a different machine or port:**
@@ -1005,23 +1081,22 @@ python3 client.py \
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--source` | — | GitHub repo URL. Required unless `--payload` is used. |
+| `--source` | — | GitHub URL, private GitHub URL, or local path. Required unless `--payload` is used. |
+| `--token` | — | GitHub PAT for private repos. Masked in output, never logged. |
 | `--scanners` | `trivy grype` | One or both of `trivy`, `grype`. |
 | `--mode` | `sequential` | `sequential` or `parallel`. |
+| `--service-version` | `v1.0` | Version label used in the Azure blob path. |
+| `--branch` | repo default | Git branch to clone. |
 | `--payload` | — | Full JSON string. Overrides all other flags. |
 | `--host` | `localhost` | Host where the scanner service is running. |
 | `--port` | `8000` | Port the scanner service is listening on. |
 | `--timeout` | `900` | Request timeout in seconds. |
 
-Current `client.py` also supports `--service-version` (default `v1.0`) and `--branch` (optional) for Azure blob path metadata and branch-specific scans.
-
-The `--source` repository must have a root-level `Dockerfile`. Repositories with a Dockerfile only inside a subdirectory are rejected by the service.
-
 ### Payload priority
 
 ```
 --payload JSON  →  highest priority, overrides everything
---source / --scanners / --mode flags  →  used if --payload not provided
+--source / --scanners / --mode / --token flags  →  used if --payload not provided
 built-in defaults  →  fallback for any flag not specified
 ```
 
@@ -1061,3 +1136,69 @@ req = urllib.request.Request(
 with urllib.request.urlopen(req, timeout=900) as resp:
     result = json.loads(resp.read())
 ```
+
+---
+
+## Using the Swagger UI (/docs)
+
+FastAPI automatically generates an interactive API explorer at `/docs`. It works like Postman — you can send real requests directly from the browser without writing any code.
+
+### Open it
+
+Once the server is running, open in your browser:
+```
+http://localhost:8000/docs
+```
+If `run.py` selected a different port (e.g. 8001), use that port instead:
+```
+http://localhost:8001/docs
+```
+
+### How to send a scan request from the UI
+
+1. Click on `POST /scan` to expand it
+2. Click the **"Try it out"** button (top right of the endpoint block)
+3. The request body field becomes editable. Replace the default with your payload:
+
+```json
+{
+  "scanners": ["trivy", "grype"],
+  "source": "https://github.com/docker/welcome-to-docker",
+  "mode": "sequential",
+  "service_version": "v1.0",
+  "branch": "main"
+}
+```
+
+4. Click **"Execute"**
+5. Scroll down to see:
+   - **Request URL** — the exact curl command it sent
+   - **Response body** — the full JSON response
+   - **Response code** — 200, 422, 500 etc.
+
+### Private repo from the UI
+
+Add the `token` field to the body:
+
+```json
+{
+  "scanners": ["trivy"],
+  "source": "https://github.com/your-org/private-repo",
+  "token": "ghp_xxxxxxxxxxxxxxxxxxxx",
+  "mode": "sequential",
+  "branch": "main"
+}
+```
+
+### Health check from the UI
+
+1. Click `GET /health`
+2. Click **"Try it out"** → **"Execute"**
+3. Response should be `{"status": "ok"}`
+
+### Tips
+
+- The UI shows all fields, their types, defaults, and which are required — no need to guess the schema
+- Responses are formatted and syntax-highlighted
+- The **"Schema"** tab next to **"Example Value"** shows the full field definitions
+- Scans take 2–3 minutes — the browser will wait for the response (timeout is handled server-side)

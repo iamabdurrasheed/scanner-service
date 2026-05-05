@@ -11,7 +11,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
 
-from utils import prepare_directories, clone_repository, build_docker_image, remove_docker_image, get_repo_info
+from utils import prepare_directories, clone_repository, build_docker_image, remove_docker_image, get_repo_info, _is_local_path
 from scanner import run_sequential, run_parallel
 from blob_storage import upload_scan_results
 
@@ -41,24 +41,29 @@ IMAGE_TAG = "sample-image:latest"
 
 class ScanRequest(BaseModel):
     scanners: list[Literal["trivy", "grype"]]
-    source: str                                        # GitHub repository URL
+    source: str                                        # GitHub URL or local path
     mode: Literal["sequential", "parallel"] = "sequential"
-    service_version: str = "v1.0"                     # e.g. v1.0, v2.3
-    branch: Optional[str] = None                      # optional Git branch to scan
+    service_version: str = "v1.0"
+    branch: Optional[str] = None
+    token: Optional[str] = None                       # GitHub PAT for private repos
 
     @field_validator("scanners")
     @classmethod
     def scanners_not_empty(cls, v):
         if not v:
             raise ValueError("At least one scanner must be specified.")
-        return list(dict.fromkeys(v))  # deduplicate while preserving order
+        return list(dict.fromkeys(v))
 
     @field_validator("source")
     @classmethod
-    def source_is_github(cls, v):
+    def source_valid(cls, v):
         v = v.strip()
+        if _is_local_path(v):
+            return v  # local path — no further validation here
         if not v.startswith("https://github.com/"):
-            raise ValueError("source must be a GitHub repository URL (https://github.com/...)")
+            raise ValueError(
+                "source must be a GitHub URL (https://github.com/...) or a local path (/path/to/repo)"
+            )
         return v
 
     @field_validator("service_version")
@@ -108,7 +113,7 @@ def scan(request: ScanRequest):
         )
 
     # ── Step 2: Clone repository ─────────────────────────────────────────────
-    ok, msg = clone_repository(request.source, request.branch)
+    ok, msg = clone_repository(request.source, request.branch, request.token)
     if not ok:
         return JSONResponse(
             status_code=422,
