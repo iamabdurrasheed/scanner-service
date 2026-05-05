@@ -62,10 +62,15 @@ class ResourceMetrics:
         return f"{round(max(self.disk_samples), 2)}GB"
 
     def to_dict(self) -> dict:
+        from datetime import datetime, timezone
+        def _fmt(ts):
+            if ts is None:
+                return None
+            return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         return {
             "pid": self.pid,
-            "start_time": self.start_time,
-            "end_time": self.end_time,
+            "start_time": _fmt(self.start_time),
+            "end_time": _fmt(self.end_time),
             "duration_seconds": self.duration_seconds,
             "cpu_avg": self.cpu_avg,
             "cpu_peak": self.cpu_peak,
