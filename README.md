@@ -21,6 +21,7 @@ A FastAPI service that accepts a GitHub repository URL, builds a Docker image fr
 13. [Working Directories](#working-directories)
 14. [Common Errors & Fixes](#common-errors--fixes)
 15. [Scan Observations & Analysis](#scan-observations--analysis)
+16. [External Service Integration](#external-service-integration)
 
 ---
 
@@ -39,6 +40,28 @@ In plain English:
 > **Why Docker containers for scanners?**  
 > Trivy and Grype do NOT need to be installed on the host. They run as Docker containers pulled from Docker Hub. This means zero manual tool installation.
 
+### Current implementation notes
+
+The current `/scan` flow also uploads each successful scanner result to Azure Blob Storage after the local JSON files are written. Credentials are loaded from environment variables, including values in a local `.env` file:
+
+```bash
+AZURE_STORAGE_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=...;AccountKey=...;EndpointSuffix=core.windows.net"
+AZURE_STORAGE_CONTAINER="scan-results"   # optional; defaults to scan-results
+```
+
+The request can include:
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `service_version` | `v1.0` | Version label used in the Azure blob path. |
+| `branch` | repo default branch | Optional Git branch to clone and scan. Omit it to use the repository default branch. |
+
+Blob paths are written as:
+
+```text
+<appname>/<service_version>/<branch>/<commit_id>/<scanner>_results.json
+```
+
 ---
 
 ## Project Structure
@@ -49,7 +72,8 @@ scanner-service/
  ├── scanner.py        # Core scan logic — sequential and parallel modes
  ├── monitor.py        # Host CPU, RAM & disk tracking using psutil
  ├── utils.py          # Directory prep, git clone, docker build helpers
- ├── run.py            # One-command setup and launch script
+ ├── run.py            # One-command setup and launch script (POC client)
+ ├── client.py         # Standalone client for external service integration
  ├── setup_scanners.py # Standalone script to pull Trivy/Grype images only
  ├── requirements.txt  # Python dependencies
  ├── output/           # Scan result JSON files (created automatically, git-ignored)
@@ -215,6 +239,8 @@ Runs `pip install -r requirements.txt` inside the venv. Installs:
 | `fastapi` | ≥ 0.111.0 | Web framework for the API |
 | `uvicorn[standard]` | ≥ 0.30.0 | ASGI server that runs FastAPI |
 | `psutil` | ≥ 5.9.8 | Host CPU, RAM and disk monitoring |
+| `azure-storage-blob` | ≥ 12.19.0 | Uploads scan JSON files to Azure Blob Storage |
+| `python-dotenv` | ≥ 1.0.1 | Loads local `.env` values for development |
 
 ### Step 5 — Pull scanner Docker images
 
@@ -476,6 +502,13 @@ Response:
 
 **Request body fields:**
 
+In addition to the original `source`, `scanners`, and `mode` fields, the current service accepts two optional metadata fields:
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `service_version` | `v1.0` | Version label used in Azure Blob Storage paths. |
+| `branch` | repo default branch | Optional Git branch to clone and scan. Omit it to scan the repository default branch. |
+
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `source` | string | ✅ | — | GitHub repo URL. Must start with `https://github.com/`. The repo must have a `Dockerfile` at its root. |
@@ -638,6 +671,16 @@ curl -X POST http://localhost:8000/scan \
 | `errors` | Only present when `status` is `partial`. Maps scanner name → error message. |
 
 ---
+
+Current response additions:
+
+| Field | Description |
+|-------|-------------|
+| `service_version` | Version label supplied in the request or defaulted to `v1.0`. |
+| `branch` | Branch that was scanned, either detected from the clone or supplied in the request. |
+| `commit_id` | Short Git commit SHA from the cloned repository. |
+| `blob_urls` | Map of scanner name to uploaded Azure Blob URL for each successful scanner result. |
+| `blob_errors` | Only present if local scanning succeeded but one or more Azure uploads failed. |
 
 ## Execution Modes Explained
 
@@ -839,3 +882,109 @@ This section documents what was observed on the host server during real scans of
 - **CPU is not the bottleneck** — peak CPU never exceeded 58% even in parallel mode. The bottleneck is network I/O (database downloads) and memory (database loading).
 - **Disk grows during scans** — each scanner downloads its vulnerability database into the Docker layer cache. This is a one-time cost per scanner image version. Subsequent scans reuse the cached database and disk usage stabilises.
 - **RAM returns to baseline after scan** — the memory spike is temporary. Once the scanner containers exit, the RAM is released back to the OS.
+
+---
+
+## External Service Integration
+
+`client.py` is a standalone script that lets any external service trigger a scan dynamically without touching `run.py`.
+
+`run.py` remains the setup and launch script with its hardcoded `POC_REQUEST`. `client.py` is the integration point for everything else.
+
+### Prerequisites
+
+The scanner service must already be running before calling `client.py`:
+```bash
+python3 run.py   # starts the server
+```
+
+### Usage
+
+**Override source only (scanners and mode use defaults):**
+```bash
+python3 client.py --source https://github.com/org/repo
+```
+
+**Specify everything explicitly:**
+```bash
+python3 client.py \
+  --source https://github.com/org/repo \
+  --scanners trivy grype \
+  --mode parallel \
+  --service-version v1.2 \
+  --branch develop
+```
+
+**Single scanner:**
+```bash
+python3 client.py --source https://github.com/org/repo --scanners trivy
+```
+
+**Full JSON payload — for service-to-service calls:**
+```bash
+python3 client.py --payload '{"source": "https://github.com/org/repo", "scanners": ["trivy", "grype"], "mode": "sequential"}'
+```
+
+**Custom host and port — if the service runs on a different machine or port:**
+```bash
+python3 client.py --host 192.168.1.10 --port 8001 --source https://github.com/org/repo
+```
+
+### Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--source` | — | GitHub repo URL. Required unless `--payload` is used. |
+| `--scanners` | `trivy grype` | One or both of `trivy`, `grype`. |
+| `--mode` | `sequential` | `sequential` or `parallel`. |
+| `--payload` | — | Full JSON string. Overrides all other flags. |
+| `--host` | `localhost` | Host where the scanner service is running. |
+| `--port` | `8000` | Port the scanner service is listening on. |
+| `--timeout` | `900` | Request timeout in seconds. |
+
+Current `client.py` also supports `--service-version` (default `v1.0`) and `--branch` (optional) for Azure blob path metadata and branch-specific scans.
+
+### Payload priority
+
+```
+--payload JSON  →  highest priority, overrides everything
+--source / --scanners / --mode flags  →  used if --payload not provided
+built-in defaults  →  fallback for any flag not specified
+```
+
+### Calling from another Python service
+
+```python
+import subprocess, json
+
+result = subprocess.run(
+    [
+        "python3", "client.py",
+        "--source", "https://github.com/org/repo",
+        "--scanners", "trivy", "grype",
+        "--mode", "parallel",
+    ],
+    capture_output=True, text=True
+)
+response = json.loads(result.stdout.split("[+] Scan response:\n")[1])
+```
+
+Or call the API directly without `client.py`:
+
+```python
+import urllib.request, json
+
+payload = {
+    "source": "https://github.com/org/repo",
+    "scanners": ["trivy", "grype"],
+    "mode": "sequential",
+}
+req = urllib.request.Request(
+    "http://localhost:8000/scan",
+    data=json.dumps(payload).encode(),
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+with urllib.request.urlopen(req, timeout=900) as resp:
+    result = json.loads(resp.read())
+```

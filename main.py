@@ -1,18 +1,19 @@
 """
 main.py - FastAPI Container Image Scanning Service
-POST /scan → clone repo → build image → run trivy/grype → return metrics
+POST /scan → clone repo → build image → run trivy/grype → upload to blob → return metrics
 """
 
 import logging
 import time
-from typing import Literal
+from typing import Literal, Optional
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
 
-from utils import prepare_directories, clone_repository, build_docker_image, remove_docker_image
+from utils import prepare_directories, clone_repository, build_docker_image, remove_docker_image, get_repo_info
 from scanner import run_sequential, run_parallel
+from blob_storage import upload_scan_results
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -40,8 +41,10 @@ IMAGE_TAG = "sample-image:latest"
 
 class ScanRequest(BaseModel):
     scanners: list[Literal["trivy", "grype"]]
-    source: str  # GitHub repository URL
+    source: str                                        # GitHub repository URL
     mode: Literal["sequential", "parallel"] = "sequential"
+    service_version: str = "v1.0"                     # e.g. v1.0, v2.3
+    branch: Optional[str] = None                      # optional Git branch to scan
 
     @field_validator("scanners")
     @classmethod
@@ -58,6 +61,24 @@ class ScanRequest(BaseModel):
             raise ValueError("source must be a GitHub repository URL (https://github.com/...)")
         return v
 
+    @field_validator("service_version")
+    @classmethod
+    def version_not_empty(cls, v):
+        v = v.strip()
+        if not v:
+            raise ValueError("service_version cannot be empty.")
+        return v
+
+    @field_validator("branch")
+    @classmethod
+    def branch_not_empty(cls, v):
+        if v is None:
+            return v
+        v = v.strip()
+        if not v:
+            raise ValueError("branch cannot be empty when provided.")
+        return v
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Endpoints
@@ -71,7 +92,10 @@ def health():
 @app.post("/scan")
 def scan(request: ScanRequest):
     start = time.time()
-    logger.info(f"Scan request: scanners={request.scanners}, mode={request.mode}, source={request.source}")
+    logger.info(
+        f"Scan request: scanners={request.scanners}, mode={request.mode}, "
+        f"source={request.source}, branch={request.branch or 'default'}"
+    )
 
     # ── Step 1: Prepare directories ──────────────────────────────────────────
     try:
@@ -84,14 +108,18 @@ def scan(request: ScanRequest):
         )
 
     # ── Step 2: Clone repository ─────────────────────────────────────────────
-    ok, msg = clone_repository(request.source)
+    ok, msg = clone_repository(request.source, request.branch)
     if not ok:
         return JSONResponse(
             status_code=422,
             content={"status": "failed", "error": msg},
         )
 
-    # ── Step 3: Build Docker image ───────────────────────────────────────────
+    # ── Step 3: Extract repo metadata (appname, branch, commit_id) ───────────
+    repo_info = get_repo_info(request.source, request.branch)
+    logger.info(f"Repo info: {repo_info}")
+
+    # ── Step 4: Build Docker image ───────────────────────────────────────────
     ok, msg = build_docker_image(IMAGE_TAG)
     if not ok:
         return JSONResponse(
@@ -99,7 +127,7 @@ def scan(request: ScanRequest):
             content={"status": "failed", "error": msg},
         )
 
-    # ── Step 4: Run scanners ─────────────────────────────────────────────────
+    # ── Step 5: Run scanners ─────────────────────────────────────────────────
     try:
         if request.mode == "sequential":
             scan_output = run_sequential(request.scanners)
@@ -113,10 +141,29 @@ def scan(request: ScanRequest):
             content={"status": "failed", "error": f"Scanner error: {str(e)}"},
         )
 
-    # ── Step 5: Remove built image to free disk ──────────────────────────────
+    # ── Step 6: Remove built image to free disk ──────────────────────────────
     remove_docker_image(IMAGE_TAG)
 
-    # ── Step 6: Build response ───────────────────────────────────────────────
+    # ── Step 7: Upload results to Azure Blob Storage ─────────────────────────
+    blob_urls = {}
+    blob_errors = {}
+
+    for scanner, local_path in scan_output["results"].items():
+        try:
+            url = upload_scan_results(
+                local_file_path=local_path,
+                appname=repo_info["appname"],
+                service_version=request.service_version,
+                branch=repo_info["branch"],
+                commit_id=repo_info["commit_id"],
+                scanner=scanner,
+            )
+            blob_urls[scanner] = url
+        except Exception as e:
+            logger.error(f"Blob upload failed for {scanner}: {e}")
+            blob_errors[scanner] = str(e)
+
+    # ── Step 8: Build response ───────────────────────────────────────────────
     total_duration = round(time.time() - start, 2)
 
     response = {
@@ -124,13 +171,20 @@ def scan(request: ScanRequest):
         "mode": request.mode,
         "image": IMAGE_TAG,
         "source": request.source,
+        "service_version": request.service_version,
+        "branch": repo_info["branch"],
+        "commit_id": repo_info["commit_id"],
         "total_duration_seconds": total_duration,
         "results": scan_output["results"],
         "resource_usage": scan_output["resource_usage"],
         "per_scanner_metrics": scan_output.get("per_scanner_metrics", {}),
+        "blob_urls": blob_urls,
     }
 
     if scan_output["errors"]:
         response["errors"] = scan_output["errors"]
+
+    if blob_errors:
+        response["blob_errors"] = blob_errors
 
     return JSONResponse(status_code=200, content=response)

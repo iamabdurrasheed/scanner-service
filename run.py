@@ -19,6 +19,8 @@ import time
 import json
 import urllib.request
 import urllib.error
+import hashlib
+import socket
 
 VENV_DIR = "venv"
 ALL_SCANNER_IMAGES = {
@@ -26,6 +28,7 @@ ALL_SCANNER_IMAGES = {
     "grype": "anchore/grype:latest",
 }
 
+# ── Hardcoded fallback — used when no CLI args are provided ───────────────────
 POC_REQUEST = {
     "scanners": ["trivy", "grype"],
     "source": "https://github.com/docker/welcome-to-docker",
@@ -80,9 +83,18 @@ python = os.path.join(VENV_DIR, "Scripts" if sys.platform == "win32" else "bin",
 
 step("Installing dependencies from requirements.txt...")
 _marker = os.path.join(VENV_DIR, ".deps_installed")
-if not os.path.isfile(_marker):
+with open("requirements.txt", "rb") as f:
+    requirements_hash = hashlib.sha256(f.read()).hexdigest()
+
+installed_hash = None
+if os.path.isfile(_marker):
+    with open(_marker, "r", encoding="utf-8") as f:
+        installed_hash = f.read().strip()
+
+if installed_hash != requirements_hash:
     subprocess.run([pip, "install", "-r", "requirements.txt"], check=True)
-    open(_marker, "w").close()
+    with open(_marker, "w", encoding="utf-8") as f:
+        f.write(requirements_hash)
     print("    Dependencies installed")
 else:
     print("    Dependencies already installed, skipping")
@@ -121,11 +133,9 @@ for d in ["/tmp/repo", OUTPUT_DIR]:
 # ── 6. Check port availability ────────────────────────────────────────────────
 
 def _port_in_use(port: int) -> bool:
-    result = subprocess.run(
-        ["ss", "-tlnp", f"sport = :{port}"],
-        capture_output=True, text=True,
-    )
-    return f":{port}" in result.stdout
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(1)
+        return sock.connect_ex(("127.0.0.1", port)) == 0
 
 
 step("Checking port availability...")

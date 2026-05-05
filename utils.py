@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import logging
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -35,14 +36,19 @@ def _clean_dir(path: str):
             logger.warning(f"Could not remove {full}: {e}")
 
 
-def clone_repository(url: str) -> tuple[bool, str]:
+def clone_repository(url: str, branch: Optional[str] = None) -> tuple[bool, str]:
     """
     Clone `url` into REPO_DIR.
     Returns (success: bool, message: str).
     """
     logger.info(f"Cloning {url} → {REPO_DIR}")
+    cmd = ["git", "clone", "--depth", "1"]
+    if branch:
+        cmd.extend(["--branch", branch])
+    cmd.extend([url, REPO_DIR])
+
     result = subprocess.run(
-        ["git", "clone", "--depth", "1", url, REPO_DIR],
+        cmd,
         capture_output=True,
         text=True,
         timeout=300,
@@ -77,6 +83,37 @@ def build_docker_image(tag: str = "sample-image:latest") -> tuple[bool, str]:
         logger.error(f"docker build failed: {msg}")
         return False, f"Docker build failed: {msg}"
     return True, f"Docker image {tag} built successfully."
+
+
+def get_repo_info(url: str, branch: Optional[str] = None) -> dict:
+    """
+    Extract repo metadata after cloning.
+    Returns appname (last segment of URL), branch, and commit_id.
+    """
+    # appname = last path segment of the URL, strip .git if present
+    appname = url.rstrip("/").split("/")[-1].replace(".git", "")
+
+    # commit_id = HEAD SHA of the cloned repo
+    result = subprocess.run(
+        ["git", "-C", REPO_DIR, "rev-parse", "HEAD"],
+        capture_output=True, text=True,
+    )
+    commit_id = result.stdout.strip()[:7] if result.returncode == 0 else "unknown"
+
+    # branch = detect from cloned repo, fall back to provided value
+    result = subprocess.run(
+        ["git", "-C", REPO_DIR, "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True,
+    )
+    detected_branch = result.stdout.strip()
+    # git clone --depth 1 may return HEAD in detached state
+    resolved_branch = detected_branch if detected_branch and detected_branch != "HEAD" else branch or "unknown"
+
+    return {
+        "appname": appname,
+        "branch": resolved_branch,
+        "commit_id": commit_id,
+    }
 
 
 def remove_docker_image(tag: str = "sample-image:latest"):
