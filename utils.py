@@ -9,12 +9,13 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-REPO_DIR = "/tmp/repo"
-OUTPUT_DIR = "/tmp/output"
+BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
+REPO_DIR   = "/tmp/repo"
+OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 
 
 def prepare_directories(clean: bool = True):
-    """Create /tmp/repo and /tmp/output, optionally wiping previous runs."""
+    """Create /tmp/repo and project output/, optionally wiping previous runs."""
     os.makedirs(REPO_DIR, exist_ok=True)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     if clean:

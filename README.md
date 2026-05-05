@@ -27,11 +27,11 @@ A FastAPI service that accepts a GitHub repository URL, builds a Docker image fr
 In plain English:
 
 1. `run.py` sends a hardcoded POST request to `/scan` (POC client)
-2. The service wipes `/tmp/repo` and `/tmp/output` clean
+2. The service wipes `/tmp/repo` and `output/` clean
 3. It clones the GitHub repo into `/tmp/repo`
 4. It builds a Docker image from the repo's `Dockerfile`
 5. It runs Trivy and/or Grype as Docker containers — **while they run**, CPU & memory are tracked in real time
-6. Results are saved to `/tmp/output/` as JSON files
+6. Results are saved to `output/` inside the project directory as JSON files
 7. A structured JSON response is returned to the caller
 
 > **Why Docker containers for scanners?**  
@@ -50,6 +50,7 @@ scanner-service/
  ├── run.py            # One-command setup and launch script
  ├── setup_scanners.py # Standalone script to pull Trivy/Grype images only
  ├── requirements.txt  # Python dependencies
+ ├── output/           # Scan result JSON files (created automatically, git-ignored)
  └── README.md
 ```
 
@@ -63,7 +64,8 @@ python3 run.py
      ├── validates Python + Docker
      ├── creates venv/, installs requirements.txt
      ├── pulls aquasec/trivy:latest + anchore/grype:latest
-     ├── creates /tmp/repo and /tmp/output
+     ├── creates /tmp/repo and output/
+     ├── kills any process on port 8000 (prevents EADDRINUSE on re-runs)
      ├── launches uvicorn → main.py  (server starts as subprocess)
      ├── waits for GET /health to return 200
      └── sends hardcoded POST /scan  ← POC client lives here
@@ -77,7 +79,7 @@ python3 run.py
                                 └── mode: sequential (default) or parallel
                                │
                           utils.py
-                          ├── prepare_directories()   → wipes /tmp/repo and /tmp/output
+                          ├── prepare_directories()   → wipes /tmp/repo and output/
                           ├── clone_repository()      → git clone --depth 1 into /tmp/repo
                           │                              checks Dockerfile exists at root
                           └── build_docker_image()    → docker build -t sample-image:latest
@@ -102,7 +104,7 @@ python3 run.py
                           └── SystemMonitor   → background thread, polls whole system every 1s
                                │
                           scanner.py writes output files
-                          ├── trivy → writes /tmp/output/trivy_result.json via -o flag
+                          ├── trivy → writes output/trivy_result.json via -o flag
                           └── grype → stdout captured → written by run_scanner_sync()
                                │
                           main.py assembles and returns JSON response
@@ -231,10 +233,14 @@ For each scanner image, it first runs `docker image inspect` to check if it's al
 ```
 [*] Ensuring required directories exist...
     /tmp/repo OK
-    /tmp/output OK
+    /home/user/scanner-service/output OK
 ```
 
-Creates `/tmp/repo` (where repos are cloned) and `/tmp/output` (where scan results are saved). Uses `os.makedirs(..., exist_ok=True)` so it never fails if they already exist.
+Creates `/tmp/repo` (where repos are cloned) and `output/` inside the project directory (where scan results are saved). Uses `os.makedirs(..., exist_ok=True)` so it never fails if they already exist. The `output/` path is resolved as an absolute path using `os.path.abspath(__file__)` so it always points to the right place regardless of where you run the script from.
+
+### Step 6b — Kill any existing process on port 8000
+
+Before starting uvicorn, `run.py` runs `fuser -k 8000/tcp` to kill any process already holding port 8000. This prevents the `[Errno 98] address already in use` error on re-runs. A 1-second sleep follows to give the OS time to release the port.
 
 ### Step 7 — Start the API server
 
@@ -314,7 +320,7 @@ If any validation fails, FastAPI returns HTTP 422 immediately and the scan never
 Before anything else, both working directories are **wiped clean**:
 
 - `/tmp/repo` — all files and subdirectories deleted
-- `/tmp/output` — all files and subdirectories deleted
+- `output/` (inside the project directory) — all files and subdirectories deleted
 
 This guarantees no leftover files from a previous scan can interfere. Uses `shutil.rmtree()` for directories and `os.remove()` for files. If this step fails → HTTP 500.
 
@@ -381,29 +387,29 @@ Both scanners run as Docker containers with two volume mounts:
 | Mount | Purpose |
 |-------|---------|
 | `/var/run/docker.sock:/var/run/docker.sock` | Lets the scanner container talk to the host Docker daemon to inspect `sample-image:latest` |
-| `/tmp/output:/output` | Lets result files land on the host filesystem |
+| `<project>/output:/output` | Bind-mounts the project `output/` directory so result files land directly in the project |
 
 **Trivy command:**
 ```bash
 docker run --rm --name trivy-scan-<timestamp> \
   --network host \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  -v /tmp/output:/output \
+  -v /home/user/scanner-service/output:/output \
   aquasec/trivy:latest \
   image -f json -o /output/trivy_result.json sample-image:latest
 ```
-Trivy writes the JSON file directly to `/output/trivy_result.json` inside the container, which maps to `/tmp/output/trivy_result.json` on the host via the bind mount.
+Trivy writes the JSON file directly to `/output/trivy_result.json` inside the container, which maps to `output/trivy_result.json` in the project directory on the host via the bind mount.
 
 **Grype command:**
 ```bash
 docker run --rm --name grype-scan-<timestamp> \
   --network host \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  -v /tmp/output:/output \
+  -v /home/user/scanner-service/output:/output \
   anchore/grype:latest \
   sample-image:latest -o json
 ```
-Grype writes JSON to stdout. `proc.communicate()` captures it, then `run_scanner_sync` writes it to `/tmp/output/grype_result.json` manually.
+Grype writes JSON to stdout. `proc.communicate()` captures it, then `run_scanner_sync` writes it to `output/grype_result.json` manually.
 
 Both use `--rm` (auto-remove container on exit) and a timestamped `--name` to avoid name collisions in parallel mode.
 
@@ -412,11 +418,11 @@ Both use `--rm` (auto-remove container on exit) and a timestamped `--name` to av
 Result files land at:
 
 ```
-/tmp/output/trivy_result.json   ← written by the Trivy container itself
-/tmp/output/grype_result.json   ← written by run_scanner_sync from captured stdout
+output/trivy_result.json   ← written by the Trivy container itself
+output/grype_result.json   ← written by run_scanner_sync from captured stdout
 ```
 
-These files are overwritten on every scan because Stage 3 wipes `/tmp/output` at the start of each request.
+These files are overwritten on every scan because Stage 3 wipes `output/` at the start of each request.
 
 ### Stage 8 — Build and return response (`main.py`)
 
@@ -492,8 +498,8 @@ curl -X POST http://localhost:8000/scan \
   "source": "https://github.com/docker/getting-started",
   "total_duration_seconds": 142.5,
   "results": {
-    "trivy": "/tmp/output/trivy_result.json",
-    "grype": "/tmp/output/grype_result.json"
+    "trivy": "/home/user/scanner-service/output/trivy_result.json",
+    "grype": "/home/user/scanner-service/output/grype_result.json"
   },
   "resource_usage": {
     "cpu_avg": "45.2%",
@@ -527,7 +533,7 @@ curl -X POST http://localhost:8000/scan \
 {
   "status": "partial",
   "results": {
-    "trivy": "/tmp/output/trivy_result.json"
+    "trivy": "/home/user/scanner-service/output/trivy_result.json"
   },
   "errors": {
     "grype": "grype failed: ..."
@@ -632,23 +638,27 @@ Both monitors populate a `ResourceMetrics` object with:
 
 ## Output Files
 
-Scan results are saved as JSON files in `/tmp/output/`:
+Scan results are saved as JSON files inside the project directory:
 
 ```
-/tmp/output/trivy_result.json
-/tmp/output/grype_result.json
+scanner-service/
+ └── output/
+      ├── trivy_result.json
+      └── grype_result.json
 ```
+
+The `output/` directory is created automatically on first run and is listed in `.gitignore` so results are never committed to the repository.
 
 These files are **overwritten on every scan** (the directory is wiped at the start of each `/scan` request).
 
 Inspect results:
 ```bash
 # Pretty-print and show first 60 lines
-cat /tmp/output/trivy_result.json | python3 -m json.tool | head -60
-cat /tmp/output/grype_result.json | python3 -m json.tool | head -60
+cat output/trivy_result.json | python3 -m json.tool | head -60
+cat output/grype_result.json | python3 -m json.tool | head -60
 ```
 
-> **Note:** The API response returns the file paths, not the file contents. The files remain on disk after the scan completes. Copy them off the server if you need to keep them — they will be deleted on the next scan.
+> **Note:** The API response returns the absolute file paths, not the file contents. The files persist on disk between runs — they are only wiped when a new `/scan` request starts.
 
 ---
 
@@ -671,11 +681,22 @@ cat /tmp/output/grype_result.json | python3 -m json.tool | head -60
 
 ---
 
-## Temporary Directories
+## Working Directories
 
 | Path | Purpose | Lifecycle |
 |------|---------|-----------|
 | `/tmp/repo` | Cloned GitHub repository | Wiped at the start of every `/scan` request |
-| `/tmp/output` | Scanner JSON result files | Wiped at the start of every `/scan` request |
+| `output/` (inside project) | Scanner JSON result files | Wiped at the start of every `/scan` request |
 
 Both directories are created by `run.py` on startup and re-created (if missing) by `utils.prepare_directories()` on each request.
+
+`output/` uses an absolute path resolved from `__file__` so it always points to the correct location regardless of the working directory you run the script from.
+
+## Common Errors & Fixes
+
+| Error | Cause | Fix |
+|-------|-------|-----|
+| `[Errno 98] address already in use` | A previous uvicorn process is still holding port 8000 | `run.py` handles this automatically with `fuser -k 8000/tcp`. If it persists: `pkill -f "uvicorn main:app"` |
+| `HTTP 403 Forbidden` on `/scan` | `output/` directory does not exist or wrong permissions when Docker tries to mount it | `run.py` creates `output/` before starting the server. If it persists: `mkdir -p output && chmod 755 output` |
+| `git clone` fails | Repo URL is wrong or network issue | Check the URL starts with `https://github.com/` and the repo is public |
+| `No Dockerfile at root` | The repo doesn't have a `Dockerfile` at its root level | Use a repo that has a `Dockerfile` at the root, not in a subdirectory |

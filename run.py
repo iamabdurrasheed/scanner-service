@@ -105,8 +105,10 @@ for name in POC_REQUEST["scanners"]:
 
 # ── 5. Ensure required directories ────────────────────────────────────────────
 
+OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
+
 step("Ensuring required directories exist...")
-for d in ["/tmp/repo", "/tmp/output"]:
+for d in ["/tmp/repo", OUTPUT_DIR]:
     os.makedirs(d, exist_ok=True)
     print(f"    {d} OK")
 
@@ -114,6 +116,10 @@ for d in ["/tmp/repo", "/tmp/output"]:
 # ── 6. Start FastAPI service ───────────────────────────────────────────────────
 
 uvicorn = os.path.join(VENV_DIR, "Scripts" if sys.platform == "win32" else "bin", "uvicorn")
+
+# Kill any process already holding port 8000 so re-runs never fail with EADDRINUSE
+subprocess.run(["fuser", "-k", "8000/tcp"], capture_output=True)
+time.sleep(1)
 
 step("Starting API server...")
 print("    API:   http://localhost:8000")

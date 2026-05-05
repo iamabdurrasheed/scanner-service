@@ -16,7 +16,8 @@ from monitor import ProcessMonitor, SystemMonitor, ResourceMetrics, merge_metric
 
 logger = logging.getLogger(__name__)
 
-OUTPUT_DIR = "/tmp/output"
+BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 IMAGE_TAG  = "sample-image:latest"
 
 # Docker Hub image references (kept in sync with setup_scanners.py)
@@ -28,7 +29,7 @@ GRYPE_IMAGE = "anchore/grype:latest"
 # ──────────────────────────────────────────────────────────────────────────────
 #
 # Both commands share the same two mounts:
-#   /tmp/output  → where JSON results are written
+#   <project>/output  → where JSON results are written
 #   /var/run/docker.sock → lets the scanner container reach the host Docker
 #                          daemon so it can inspect sample-image:latest
 #
