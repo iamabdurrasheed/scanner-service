@@ -18,7 +18,9 @@ A FastAPI service that accepts a GitHub repository URL, builds a Docker image fr
 10. [Resource Monitoring Explained](#resource-monitoring-explained)
 11. [Output Files](#output-files)
 12. [Error Handling](#error-handling)
-13. [Temporary Directories](#temporary-directories)
+13. [Working Directories](#working-directories)
+14. [Common Errors & Fixes](#common-errors--fixes)
+15. [Scan Observations & Analysis](#scan-observations--analysis)
 
 ---
 
@@ -488,7 +490,7 @@ curl -X POST http://localhost:8000/scan \
   }'
 ```
 
-**Success response (`status: completed`):**
+**Success response (`status: completed`) — parallel mode:**
 ```json
 {
   "status": "completed",
@@ -532,6 +534,55 @@ curl -X POST http://localhost:8000/scan \
       "memory_peak": "3871.2MB",
       "disk_used_avg": "83.25GB",
       "disk_used_peak": "84.34GB"
+    }
+  }
+}
+```
+
+**Success response (`status: completed`) — sequential mode:**
+```json
+{
+  "status": "completed",
+  "mode": "sequential",
+  "image": "sample-image:latest",
+  "source": "https://github.com/docker/welcome-to-docker",
+  "total_duration_seconds": 181.23,
+  "results": {
+    "trivy": "scanner-service/output/trivy_result.json",
+    "grype": "scanner-service/output/grype_result.json"
+  },
+  "resource_usage": {
+    "cpu_avg": "27.1%",
+    "cpu_peak": "54.0%",
+    "memory_avg": "3578.7MB",
+    "memory_peak": "3817.5MB",
+    "disk_used_avg": "82.78GB",
+    "disk_used_peak": "83.23GB"
+  },
+  "per_scanner_metrics": {
+    "trivy": {
+      "pid": 2305616,
+      "start_time": "2026-05-05 12:58:58 UTC",
+      "end_time": "2026-05-05 12:59:38 UTC",
+      "duration_seconds": 39.13,
+      "cpu_avg": "30.4%",
+      "cpu_peak": "54.0%",
+      "memory_avg": "3288.8MB",
+      "memory_peak": "3425.9MB",
+      "disk_used_avg": "82.52GB",
+      "disk_used_peak": "82.94GB"
+    },
+    "grype": {
+      "pid": 2305946,
+      "start_time": "2026-05-05 12:59:38 UTC",
+      "end_time": "2026-05-05 13:01:56 UTC",
+      "duration_seconds": 138.54,
+      "cpu_avg": "26.2%",
+      "cpu_peak": "36.3%",
+      "memory_avg": "3660.7MB",
+      "memory_peak": "3817.5MB",
+      "disk_used_avg": "82.86GB",
+      "disk_used_peak": "83.23GB"
     }
   }
 }
@@ -710,3 +761,67 @@ Both directories are created by `run.py` on startup and re-created (if missing) 
 | `HTTP 403 Forbidden` on `/scan` | `output/` directory does not exist or wrong permissions when Docker tries to mount it | `run.py` creates `output/` before starting the server. If it persists: `mkdir -p output && chmod 755 output` |
 | `git clone` fails | Repo URL is wrong or network issue | Check the URL starts with `https://github.com/` and the repo is public |
 | `No Dockerfile at root` | The repo doesn't have a `Dockerfile` at its root level | Use a repo that has a `Dockerfile` at the root, not in a subdirectory |
+
+---
+
+## Scan Observations & Analysis
+
+This section documents what was observed on the host server during real scans of `docker/welcome-to-docker`.
+
+---
+
+### Sequential vs Parallel — Side by Side
+
+| Metric | Sequential | Parallel |
+|--------|-----------|---------|
+| Total duration | 181.23s | 142.03s |
+| Time saved | — | ~39s (22% faster) |
+| CPU avg | 27.1% | 32.3% |
+| CPU peak | 54.0% | 57.3% |
+| RAM avg | 3578.7MB | 3664.3MB |
+| RAM peak | 3817.5MB | 3871.2MB |
+| Disk avg | 82.78GB | 83.24GB |
+| Disk peak | 83.23GB | 84.34GB |
+
+---
+
+### Sequential Mode — Observations
+
+**Trivy (12:58:58 → 12:59:38, 39s)**
+
+- CPU spiked to **54.0%** — the highest point of the entire sequential run
+- RAM started at ~3288MB and climbed to **3425.9MB** during the scan
+- Disk grew from ~82.52GB to **82.94GB** — Trivy downloads its vulnerability database on first run and caches it inside the container layer
+
+**Grype (12:59:38 → 13:01:56, 138s)**
+
+- Grype took **3.5× longer** than Trivy (138s vs 39s) — Grype downloads and processes a larger vulnerability database
+- CPU dropped to an average of **26.2%** and peaked at only **36.3%** — Grype is more I/O bound than CPU bound
+- RAM climbed significantly to **3817.5MB peak** — Grype loads its full database into memory for matching
+- Disk grew to **83.23GB peak** — Grype's database download accounts for the additional ~0.3GB
+
+**Combined resource_usage (sequential)**
+
+- CPU avg **27.1%** — lower than Trivy alone because Grype's long idle I/O wait pulls the average down
+- RAM peak **3817.5MB** — driven entirely by Grype's in-memory database
+- Disk peak **83.23GB** — net ~0.45GB increase from scanner database downloads
+
+---
+
+### Parallel Mode — Observations
+
+- Both scanners started at the same timestamp (`12:46:56 UTC`) — confirmed truly concurrent
+- CPU peak **57.3%** — slightly higher than sequential (54%) because both scanners competed for CPU simultaneously
+- RAM peak **3871.2MB** — slightly higher than sequential (3817.5MB) because both databases were loaded at the same time
+- Disk peak **84.34GB** — higher than sequential (83.23GB) because both scanners wrote their databases concurrently
+- Total time **142s** vs sequential **181s** — parallel saved 39 seconds because Trivy (58s) ran entirely within Grype's window (137s)
+
+---
+
+### Key Takeaways
+
+- **Grype is the bottleneck** — it takes 3–4× longer than Trivy regardless of mode. This is expected: Grype's vulnerability database is larger and it does more thorough matching.
+- **Parallel mode is faster but uses more resources** — peak RAM and disk are higher because both scanners load their databases simultaneously. On a memory-constrained server, sequential is safer.
+- **CPU is not the bottleneck** — peak CPU never exceeded 58% even in parallel mode. The bottleneck is network I/O (database downloads) and memory (database loading).
+- **Disk grows during scans** — each scanner downloads its vulnerability database into the Docker layer cache. This is a one-time cost per scanner image version. Subsequent scans reuse the cached database and disk usage stabilises.
+- **RAM returns to baseline after scan** — the memory spike is temporary. Once the scanner containers exit, the RAM is released back to the OS.
