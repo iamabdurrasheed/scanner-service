@@ -1,6 +1,6 @@
 # Container Image Scanning Service
 
-A FastAPI service that accepts a GitHub repository URL, builds a Docker image from it, and scans it for security vulnerabilities using **Trivy** and/or **Grype** — with real-time CPU & memory monitoring per scanner.
+A FastAPI service that accepts a GitHub repository URL, builds a Docker image from it, and scans it for security vulnerabilities using **Trivy** and/or **Grype** — with real-time host CPU, RAM and disk monitoring per scanner.
 
 ---
 
@@ -30,7 +30,7 @@ In plain English:
 2. The service wipes `/tmp/repo` and `output/` clean
 3. It clones the GitHub repo into `/tmp/repo`
 4. It builds a Docker image from the repo's `Dockerfile`
-5. It runs Trivy and/or Grype as Docker containers — **while they run**, CPU & memory are tracked in real time
+5. It runs Trivy and/or Grype as Docker containers — **while they run**, host CPU, RAM and disk are tracked in real time
 6. Results are saved to `output/` inside the project directory as JSON files
 7. A structured JSON response is returned to the caller
 
@@ -45,7 +45,7 @@ In plain English:
 scanner-service/
  ├── main.py           # FastAPI app — defines /health and /scan endpoints
  ├── scanner.py        # Core scan logic — sequential and parallel modes
- ├── monitor.py        # CPU & memory tracking using psutil
+ ├── monitor.py        # Host CPU, RAM & disk tracking using psutil
  ├── utils.py          # Directory prep, git clone, docker build helpers
  ├── run.py            # One-command setup and launch script
  ├── setup_scanners.py # Standalone script to pull Trivy/Grype images only
@@ -65,7 +65,7 @@ python3 run.py
      ├── creates venv/, installs requirements.txt
      ├── pulls aquasec/trivy:latest + anchore/grype:latest
      ├── creates /tmp/repo and output/
-     ├── kills any process on port 8000 (prevents EADDRINUSE on re-runs)
+     ├── checks port availability (auto-selects 8000–8009)
      ├── launches uvicorn → main.py  (server starts as subprocess)
      ├── waits for GET /health to return 200
      └── sends hardcoded POST /scan  ← POC client lives here
@@ -99,8 +99,7 @@ python3 run.py
                                 each scanner still gets its own ProcessMonitor
                                │
                           monitor.py
-                          ├── ProcessMonitor  → background thread, polls PID every 1s
-                          │                     includes child processes of docker run
+                          ├── ProcessMonitor  → background thread, polls host CPU/RAM/disk every 1s
                           └── SystemMonitor   → background thread, polls whole system every 1s
                                │
                           scanner.py writes output files
@@ -210,7 +209,7 @@ Runs `pip install -r requirements.txt` inside the venv. Installs:
 |---------|---------|---------|
 | `fastapi` | ≥ 0.111.0 | Web framework for the API |
 | `uvicorn[standard]` | ≥ 0.30.0 | ASGI server that runs FastAPI |
-| `psutil` | ≥ 5.9.8 | CPU and memory monitoring |
+| `psutil` | ≥ 5.9.8 | Host CPU, RAM and disk monitoring |
 
 ### Step 5 — Pull scanner Docker images
 
@@ -221,12 +220,7 @@ Runs `pip install -r requirements.txt` inside the venv. Installs:
     grype ready
 ```
 
-For each scanner image, it first runs `docker image inspect` to check if it's already cached locally. Only pulls if not present. This avoids re-downloading large images on every restart.
-
-| Scanner | Docker Image |
-|---------|-------------|
-| Trivy | `aquasec/trivy:latest` |
-| Grype | `anchore/grype:latest` |
+Only pulls images listed in `POC_REQUEST["scanners"]`. For each, runs `docker image inspect` first — skips the pull if already cached locally.
 
 ### Step 6 — Create working directories
 
@@ -236,11 +230,16 @@ For each scanner image, it first runs `docker image inspect` to check if it's al
     /home/user/scanner-service/output OK
 ```
 
-Creates `/tmp/repo` (where repos are cloned) and `output/` inside the project directory (where scan results are saved). Uses `os.makedirs(..., exist_ok=True)` so it never fails if they already exist. The `output/` path is resolved as an absolute path using `os.path.abspath(__file__)` so it always points to the right place regardless of where you run the script from.
+Creates `/tmp/repo` and `output/` inside the project directory. Uses `os.makedirs(..., exist_ok=True)` so it never fails if they already exist. `output/` is resolved as an absolute path from `__file__`.
 
-### Step 6b — Kill any existing process on port 8000
+### Step 6b — Check port availability
 
-Before starting uvicorn, `run.py` runs `fuser -k 8000/tcp` to kill any process already holding port 8000. This prevents the `[Errno 98] address already in use` error on re-runs. A 1-second sleep follows to give the OS time to release the port.
+```
+[*] Checking port availability...
+    Using port 8000
+```
+
+Uses `ss -tlnp` to check if port 8000 is free. Automatically tries 8001, 8002 ... up to 8009 and picks the first free one. If all are in use, exits with an error.
 
 ### Step 7 — Start the API server
 
@@ -250,7 +249,7 @@ Before starting uvicorn, `run.py` runs `fuser -k 8000/tcp` to kill any process a
     Docs:  http://localhost:8000/docs
 ```
 
-Launches `uvicorn main:app --host 0.0.0.0 --port 8000` using `subprocess.Popen`, which starts uvicorn as a **child process** and returns immediately. `run.py` stays alive so it can send the POC request and keep the server running after.
+Launches `uvicorn main:app --host 0.0.0.0 --port <PORT>` using `subprocess.Popen`, which starts uvicorn as a **child process** and returns immediately. `run.py` stays alive so it can send the POC request and keep the server running after.
 
 ### Step 8 — Wait for server to be ready
 
@@ -267,8 +266,8 @@ Polls `GET /health` every 1 second for up to 30 seconds. Only proceeds to the sc
 [*] Sending POC scan request...
     {
         "scanners": ["trivy", "grype"],
-        "source": "https://github.com/docker/getting-started",
-        "mode": "sequential"
+        "source": "https://github.com/docker/welcome-to-docker",
+        "mode": "parallel"
     }
 
 [+] Scan response:
@@ -280,7 +279,7 @@ Polls `GET /health` every 1 second for up to 30 seconds. Only proceeds to the sc
 ### Step 10 — Keep server running
 
 ```
-[*] Server still running. Press Ctrl+C to stop.
+[*] Server still running on port 8000. Press Ctrl+C to stop.
 ```
 
 After the POC scan completes, the server stays alive so you can send additional requests manually. `server.wait()` blocks until the process exits. Ctrl+C calls `server.terminate()` to shut down uvicorn cleanly.
@@ -298,7 +297,7 @@ Here is exactly what happens from the moment `run.py` fires the POC request to t
 ```python
 POC_REQUEST = {
     "scanners": ["trivy", "grype"],
-    "source": "https://github.com/docker/getting-started",
+    "source": "https://github.com/docker/welcome-to-docker",
     "mode": "sequential",
 }
 ```
@@ -358,7 +357,7 @@ grype finishes    → ProcessMonitor.stop()             ← monitoring ends
 ```
 
 - `subprocess.Popen()` launches the scanner — `Popen` (not `run`) is used specifically because it returns the PID immediately so the monitor can attach before the process finishes
-- `ProcessMonitor.start(pid)` spins up a background thread that polls `psutil.Process(pid)` every 1 second
+- `ProcessMonitor.start(pid)` spins up a background thread that polls **host-level** `psutil.cpu_percent()`, `psutil.virtual_memory()` and `psutil.disk_usage("/")` every 1 second
 - `proc.communicate(timeout=600)` blocks until the scanner finishes, collecting stdout/stderr
 - `ProcessMonitor.stop()` signals the thread to stop and records `end_time`
 - `merge_metrics()` combines both scanners' sample lists into one `resource_usage` dict
@@ -377,7 +376,7 @@ SystemMonitor.stop()           ← system-wide monitoring ends
 - `run_parallel()` calls `asyncio.run(run_parallel_async())`
 - `run_parallel_async()` starts a `SystemMonitor` then fires all scanners via `asyncio.gather()`
 - Each scanner runs in a thread pool via `loop.run_in_executor(None, run_scanner_sync, scanner)` — this is what makes them truly concurrent
-- `SystemMonitor` polls `psutil.cpu_percent()` and `psutil.virtual_memory()` for the whole machine every 1 second
+- `SystemMonitor` polls `psutil.cpu_percent()`, `psutil.virtual_memory()` and `psutil.disk_usage("/")` for the whole machine every 1 second
 - Each scanner still gets its own `ProcessMonitor` for `per_scanner_metrics`
 
 #### How each scanner runs internally (`run_scanner_sync`)
@@ -430,8 +429,8 @@ These files are overwritten on every scan because Stage 3 wipes `output/` at the
 
 - `status` → `"completed"` if errors dict is empty, `"partial"` if any scanner failed
 - `results` → map of scanner name to output file path
-- `resource_usage` → combined cpu/mem (merged ProcessMonitor samples in sequential, SystemMonitor in parallel)
-- `per_scanner_metrics` → per-scanner pid, duration, cpu avg/peak, memory avg/peak
+- `resource_usage` → combined cpu/mem/disk (merged ProcessMonitor samples in sequential, SystemMonitor in parallel)
+- `per_scanner_metrics` → per-scanner pid, start/end time (UTC), duration, cpu avg/peak, memory avg/peak, disk avg/peak
 - `errors` → only included when `status` is `"partial"`
 
 ### Stage 9 — run.py prints response to terminal
@@ -473,7 +472,7 @@ curl -X POST http://localhost:8000/scan \
   -H "Content-Type: application/json" \
   -d '{
     "scanners": ["trivy"],
-    "source": "https://github.com/docker/getting-started",
+    "source": "https://github.com/docker/welcome-to-docker",
     "mode": "sequential"
   }'
 ```
@@ -484,7 +483,7 @@ curl -X POST http://localhost:8000/scan \
   -H "Content-Type: application/json" \
   -d '{
     "scanners": ["trivy", "grype"],
-    "source": "https://github.com/docker/getting-started",
+    "source": "https://github.com/docker/welcome-to-docker",
     "mode": "parallel"
   }'
 ```
@@ -495,34 +494,44 @@ curl -X POST http://localhost:8000/scan \
   "status": "completed",
   "mode": "parallel",
   "image": "sample-image:latest",
-  "source": "https://github.com/docker/getting-started",
-  "total_duration_seconds": 142.5,
+  "source": "https://github.com/docker/welcome-to-docker",
+  "total_duration_seconds": 142.03,
   "results": {
-    "trivy": "/home/user/scanner-service/output/trivy_result.json",
-    "grype": "/home/user/scanner-service/output/grype_result.json"
+    "trivy": "scanner-service/output/trivy_result.json",
+    "grype": "scanner-service/output/grype_result.json"
   },
   "resource_usage": {
-    "cpu_avg": "45.2%",
-    "cpu_peak": "80.1%",
-    "memory_avg": "312.4MB",
-    "memory_peak": "498.7MB"
+    "cpu_avg": "32.3%",
+    "cpu_peak": "57.3%",
+    "memory_avg": "3664.3MB",
+    "memory_peak": "3871.2MB",
+    "disk_used_avg": "83.24GB",
+    "disk_used_peak": "84.34GB"
   },
   "per_scanner_metrics": {
     "trivy": {
       "pid": 12345,
-      "duration_seconds": 38.1,
-      "cpu_avg": "42.0%",
-      "cpu_peak": "75.3%",
-      "memory_avg": "280.0MB",
-      "memory_peak": "420.0MB"
+      "start_time": "2026-05-05 12:46:56 UTC",
+      "end_time": "2026-05-05 12:47:54 UTC",
+      "duration_seconds": 58.22,
+      "cpu_avg": "41.9%",
+      "cpu_peak": "57.4%",
+      "memory_avg": "3633.8MB",
+      "memory_peak": "3871.2MB",
+      "disk_used_avg": "83.45GB",
+      "disk_used_peak": "84.34GB"
     },
     "grype": {
       "pid": 12346,
-      "duration_seconds": 41.7,
-      "cpu_avg": "48.5%",
-      "cpu_peak": "80.1%",
-      "memory_avg": "344.8MB",
-      "memory_peak": "498.7MB"
+      "start_time": "2026-05-05 12:46:56 UTC",
+      "end_time": "2026-05-05 12:49:14 UTC",
+      "duration_seconds": 137.54,
+      "cpu_avg": "32.4%",
+      "cpu_peak": "57.3%",
+      "memory_avg": "3667.8MB",
+      "memory_peak": "3871.2MB",
+      "disk_used_avg": "83.25GB",
+      "disk_used_peak": "84.34GB"
     }
   }
 }
@@ -533,12 +542,11 @@ curl -X POST http://localhost:8000/scan \
 {
   "status": "partial",
   "results": {
-    "trivy": "/home/user/scanner-service/output/trivy_result.json"
+    "trivy": "scanner-service/output/trivy_result.json"
   },
   "errors": {
     "grype": "grype failed: ..."
-  },
-  ...
+  }
 }
 ```
 
@@ -560,8 +568,8 @@ curl -X POST http://localhost:8000/scan \
 | `source` | The GitHub URL that was provided. |
 | `total_duration_seconds` | Wall-clock time from request received to response sent. |
 | `results` | Map of scanner name → path to the JSON result file on disk. |
-| `resource_usage` | Combined CPU/memory stats across all scanners. |
-| `per_scanner_metrics` | Per-scanner breakdown including PID, duration, CPU, and memory. |
+| `resource_usage` | Host CPU, RAM and disk stats across the full scan window. |
+| `per_scanner_metrics` | Per-scanner breakdown including PID, UTC start/end times, duration, CPU, RAM and disk. |
 | `errors` | Only present when `status` is `partial`. Maps scanner name → error message. |
 
 ---
@@ -590,8 +598,8 @@ Monitoring: SystemMonitor (whole system, every 1s)
 ```
 
 - Both scanners start simultaneously using `asyncio.gather()` + a thread pool executor
-- A `SystemMonitor` tracks overall system CPU and memory (not per-process) for the duration
-- `resource_usage` reflects system-wide usage during the parallel window
+- A `SystemMonitor` tracks overall system CPU, RAM and disk for the duration
+- `resource_usage` reflects system-wide CPU, RAM and disk usage during the parallel window
 - `per_scanner_metrics` still shows per-scanner PID and duration from their individual `ProcessMonitor`
 
 > **Which mode should I use?**  
@@ -606,21 +614,22 @@ Resource monitoring is handled entirely in `monitor.py` using the `psutil` libra
 
 ### ProcessMonitor
 
-Used in both sequential and parallel modes to track a specific scanner process.
+Used in both sequential and parallel modes. Attached per scanner — each scanner gets its own monitor window.
 
 - Starts a background thread when `start(pid)` is called
-- Every 1 second, reads `cpu_percent` and `memory_info().rss` from the process
-- Also walks all child processes (recursive) and adds their CPU/memory to the sample
+- Every 1 second, reads **host-level** `psutil.cpu_percent()`, `psutil.virtual_memory()` and `psutil.disk_usage("/")`
 - Stops when `stop()` is called
 - Computes `avg` and `peak` from all collected samples
 
+> **Why host-level and not per-process?** The scanners run inside Docker containers. The `docker run` host process is just a thin wrapper — all the actual CPU and memory work happens inside the container kernel namespace which psutil cannot see directly. Polling the host gives accurate real-world server load numbers.
+
 ### SystemMonitor
 
-Used only in parallel mode to track the whole machine.
+Used only in parallel mode to track the whole machine for the entire parallel window.
 
-- Polls `psutil.cpu_percent()` and `psutil.virtual_memory()` every 1 second
+- Polls `psutil.cpu_percent()`, `psutil.virtual_memory()` and `psutil.disk_usage("/")` every 1 second
 - Measures used memory as `total - available`
-- Gives a system-wide view of load during the parallel scan window
+- Measures used disk on the root `/` partition
 
 ### ResourceMetrics dataclass
 
@@ -628,11 +637,12 @@ Both monitors populate a `ResourceMetrics` object with:
 
 | Field | Description |
 |-------|-------------|
-| `pid` | Process ID being monitored (None for SystemMonitor) |
-| `start_time` / `end_time` | Unix timestamps |
+| `pid` | Process ID of the `docker run` host process |
+| `start_time` / `end_time` | Human-readable UTC timestamps (e.g. `2026-05-05 12:46:56 UTC`) |
 | `duration_seconds` | `end_time - start_time` |
-| `cpu_avg` / `cpu_peak` | Average and peak CPU percentage |
-| `memory_avg` / `memory_peak` | Average and peak RSS memory in MB |
+| `cpu_avg` / `cpu_peak` | Average and peak host CPU percentage |
+| `memory_avg` / `memory_peak` | Average and peak host RAM used in MB |
+| `disk_used_avg` / `disk_used_peak` | Average and peak host disk used on `/` in GB |
 
 ---
 
@@ -696,7 +706,7 @@ Both directories are created by `run.py` on startup and re-created (if missing) 
 
 | Error | Cause | Fix |
 |-------|-------|-----|
-| `[Errno 98] address already in use` | A previous uvicorn process is still holding port 8000 | `run.py` handles this automatically with `fuser -k 8000/tcp`. If it persists: `pkill -f "uvicorn main:app"` |
+| `[Errno 98] address already in use` | Port 8000 is taken by another process | `run.py` automatically tries ports 8001–8009 and picks the first free one |
 | `HTTP 403 Forbidden` on `/scan` | `output/` directory does not exist or wrong permissions when Docker tries to mount it | `run.py` creates `output/` before starting the server. If it persists: `mkdir -p output && chmod 755 output` |
 | `git clone` fails | Repo URL is wrong or network issue | Check the URL starts with `https://github.com/` and the repo is public |
 | `No Dockerfile at root` | The repo doesn't have a `Dockerfile` at its root level | Use a repo that has a `Dockerfile` at the root, not in a subdirectory |
