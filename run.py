@@ -118,8 +118,13 @@ for d in ["/tmp/repo", OUTPUT_DIR]:
 uvicorn = os.path.join(VENV_DIR, "Scripts" if sys.platform == "win32" else "bin", "uvicorn")
 
 # Kill any process already holding port 8000 so re-runs never fail with EADDRINUSE
-subprocess.run(["fuser", "-k", "8000/tcp"], capture_output=True)
-time.sleep(1)
+# Try multiple methods in order — fuser may not be installed on all systems
+for kill_cmd in (
+    ["fuser", "-k", "8000/tcp"],
+    ["pkill", "-f", "uvicorn main:app"],
+):
+    subprocess.run(kill_cmd, capture_output=True)
+time.sleep(2)  # give OS time to release the port
 
 step("Starting API server...")
 print("    API:   http://localhost:8000")
@@ -132,7 +137,13 @@ server = subprocess.Popen(
 # ── 7. Wait for server to be ready ────────────────────────────────────────────
 
 step("Waiting for server to be ready...")
+# Poll until the server process we just launched is alive and responding.
+# We check server.poll() is None (process still running) before accepting
+# a 200 from /health — this prevents a stale old server from fooling us.
 for _ in range(30):
+    if server.poll() is not None:
+        server.terminate()
+        fail("Server process exited unexpectedly during startup")
     try:
         urllib.request.urlopen("http://localhost:8000/health", timeout=2)
         print("    Server is up")
