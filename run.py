@@ -6,6 +6,9 @@ Also acts as the POC client — fires a hardcoded /scan request once the
 server is ready and prints the response.
 
     python3 run.py
+
+To use a different port if 8000 is taken:
+    PORT=8001 python3 run.py
 """
 
 import os
@@ -28,6 +31,8 @@ POC_REQUEST = {
     "source": "https://github.com/docker/getting-started",
     "mode": "sequential",
 }
+
+PORT = int(os.environ.get("PORT", 8000))
 
 
 def step(msg: str):
@@ -67,7 +72,7 @@ if not os.path.isdir(VENV_DIR):
 else:
     print(f"    '{VENV_DIR}' already exists, skipping")
 
-pip = os.path.join(VENV_DIR, "Scripts" if sys.platform == "win32" else "bin", "pip")
+pip    = os.path.join(VENV_DIR, "Scripts" if sys.platform == "win32" else "bin", "pip")
 python = os.path.join(VENV_DIR, "Scripts" if sys.platform == "win32" else "bin", "python")
 
 
@@ -113,39 +118,46 @@ for d in ["/tmp/repo", OUTPUT_DIR]:
     print(f"    {d} OK")
 
 
-# ── 6. Start FastAPI service ───────────────────────────────────────────────────
+# ── 6. Check port availability ────────────────────────────────────────────────
+
+def _port_in_use(port: int) -> bool:
+    result = subprocess.run(
+        ["ss", "-tlnp", f"sport = :{port}"],
+        capture_output=True, text=True,
+    )
+    return f":{port}" in result.stdout
+
+
+step("Checking port availability...")
+for PORT in range(8000, 8010):
+    if not _port_in_use(PORT):
+        print(f"    Using port {PORT}")
+        break
+else:
+    fail("Ports 8000-8009 are all in use. Free up a port and try again.")
+
+
+# ── 7. Start FastAPI service ───────────────────────────────────────────────────
 
 uvicorn = os.path.join(VENV_DIR, "Scripts" if sys.platform == "win32" else "bin", "uvicorn")
 
-# Kill any process already holding port 8000 so re-runs never fail with EADDRINUSE
-# Try multiple methods in order — fuser may not be installed on all systems
-for kill_cmd in (
-    ["fuser", "-k", "8000/tcp"],
-    ["pkill", "-f", "uvicorn main:app"],
-):
-    subprocess.run(kill_cmd, capture_output=True)
-time.sleep(2)  # give OS time to release the port
-
 step("Starting API server...")
-print("    API:   http://localhost:8000")
-print("    Docs:  http://localhost:8000/docs\n")
+print(f"    API:   http://localhost:{PORT}")
+print(f"    Docs:  http://localhost:{PORT}/docs\n")
 
 server = subprocess.Popen(
-    [uvicorn, "main:app", "--host", "0.0.0.0", "--port", "8000"]
+    [uvicorn, "main:app", "--host", "0.0.0.0", "--port", str(PORT)]
 )
 
-# ── 7. Wait for server to be ready ────────────────────────────────────────────
+
+# ── 8. Wait for server to be ready ────────────────────────────────────────────
 
 step("Waiting for server to be ready...")
-# Poll until the server process we just launched is alive and responding.
-# We check server.poll() is None (process still running) before accepting
-# a 200 from /health — this prevents a stale old server from fooling us.
 for _ in range(30):
     if server.poll() is not None:
-        server.terminate()
-        fail("Server process exited unexpectedly during startup")
+        fail("Server process exited unexpectedly — check logs above")
     try:
-        urllib.request.urlopen("http://localhost:8000/health", timeout=2)
+        urllib.request.urlopen(f"http://localhost:{PORT}/health", timeout=2)
         print("    Server is up")
         break
     except Exception:
@@ -154,14 +166,15 @@ else:
     server.terminate()
     fail("Server did not start within 30 seconds")
 
-# ── 8. POC hardcoded scan request ─────────────────────────────────────────────
+
+# ── 9. POC hardcoded scan request ─────────────────────────────────────────────
 
 step("Sending POC scan request...")
 print(f"    {json.dumps(POC_REQUEST, indent=4)}\n")
 
 try:
     req = urllib.request.Request(
-        "http://localhost:8000/scan",
+        f"http://localhost:{PORT}/scan",
         data=json.dumps(POC_REQUEST).encode(),
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -175,9 +188,10 @@ except urllib.error.HTTPError as e:
 except Exception as e:
     print(f"[ERROR] Request failed: {e}", file=sys.stderr)
 
+
 # ── Keep server running ────────────────────────────────────────────────────────
 
-print("\n[*] Server still running. Press Ctrl+C to stop.")
+print(f"\n[*] Server still running on port {PORT}. Press Ctrl+C to stop.")
 try:
     server.wait()
 except KeyboardInterrupt:
